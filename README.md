@@ -79,6 +79,8 @@ Want to add support for new hardware? See the **[Driver Development Guide](READM
 - MCP protocol implementation (JSON-RPC 2.0 methods)
 - Tool definition spec (`inputSchema`, `configSchema`, `multiInstance`, `x-action-params`)
 - Instance management (`multiInstance` flag, `scope` for config fields)
+- Config field formats — masked secrets (`format: "password"`, `x-sensitive`) and a QR code
+  for "install the app on your phone" / "point your phone at this robot" (`format: "qr"`)
 - Plugin lifecycle (`__init__`, `get_tool`, `start`, `stop`, `dispatch`)
 - `driver.yaml` and `config.yaml` metadata format
 - Registration and heartbeat with Agent Core
@@ -134,6 +136,8 @@ The Agent Core Web Dashboard renders live data streams based on the `format` fie
 | `sensor/lidar*` | Lidar scan | 2D/3D lidar point visualization |
 | `sensor/pointcloud` | Point cloud | 3D point cloud renderer |
 | `sensor/mapping` | 2D Map | Occupancy grid / SLAM map |
+| `state/odom` | Text / KV panel | `motus.odom/1` — what the robot reports about its own motion |
+| `control/velocity` | Text / KV panel | `motus.control/1` `twist` — a command stream **into** a driver |
 
 ### Skeleton Rendering (`sensor/skeleton`)
 
@@ -151,6 +155,56 @@ For robot state monitoring, declare `"format": "sensor/skeleton"` in `topic_out`
 - Joint data published as `{"joints": [{"idx": 0, "name": "joint_name", "q": angle}, ...]}`
 - **Joint names in data must match URDF joint names exactly** (e.g., `FL_hip_joint` not `FL_hip`)
 - **`dispatch()` must return a plain dict** (e.g. `{"urdf": "..."}`) — do NOT return pre-wrapped MCP content arrays (see README_dev.md § "dispatch() Return Value Format")
+
+---
+
+## Being Driven by an Execution Model (`motus.control/1`)
+
+A VLA policy, a navigation stack or a grasp policy produces **tens of commands per
+second**, and each one is not a question. MCP `tools/call` is the wrong shape for
+that — it is the control plane: low frequency, request/response, authorised. So
+those commands go on the **data plane** instead: a `control/*` DDS topic, exactly
+as a speaker already takes its audio on `topic_in: audio/pcm-16k` while its
+start/stop go through tools.
+
+To make a robot drivable this way, add a **servo card** to its driver. Two exist
+to copy from: `realman/rm75_6f_v/servo.py` (single 7-DOF arm) and
+`x-humanoid/tianyi2.0/servo.py` (dual arm + hands, using the descriptor's
+`groups`).
+
+A servo card is two things:
+
+| | What | Where |
+|---|---|---|
+| **Descriptor** | what this robot accepts — dof, `joint_names` (the order *is* the meaning of `values`), units, limits, rate, `force_torque` | your card's `info()` |
+| **`ControlSink`** | runs every incoming command through freshness, source arbitration, step clamping, hard limits and the watchdog | `common/control/sink.py` |
+
+**Do not write those checks yourself.** The arm's safety properties come from the
+sink, which is ROS-free, takes an injected clock, and is tested without a robot.
+What belongs in your file is only what is specific to this machine: unit
+conversion at the SDK boundary, the vendor's motion-enable gate, and which call
+stops it.
+
+Four rules that are easy to get wrong:
+
+- **A URDF is not a descriptor.** It has no units, no control rate, no statement of
+  absolute vs incremental, no normalisation range. Reference it via `urdf_ref` for
+  FK and collision geometry; do not derive the action interface from it.
+- **`force_torque` must be present even as `null`.** `parse_descriptor` rejects a
+  descriptor that omits it — omitting it is how a robot ends up assumed to have a
+  protection it does not have.
+- **Build the descriptor from the same source as your feedback.** If the state you
+  publish and the commands you accept come from two hand-written tables, they will
+  eventually disagree about what the machine can do.
+- **A pause is not a safe state.** When commands stop, the robot holds and then
+  resumes *without warning* the moment a valid one lands. `ttl_ms` is the only
+  thing keeping it from resuming on a stale command.
+
+Full field spec, the check chain and its failure verdicts: **README_dev.md
+§ "Continuous Control (`motus.control/1`)"**. Architecture, how a model is
+attached at the other end, and the requirements that will be added to servo cards
+as models get more capable (torque/impedance control, jitter bounds, true sensor
+timestamps, chunk-level acknowledgement): **`phanthymotus/docs/vla-integration.md`**.
 
 ---
 

@@ -1313,11 +1313,29 @@ class CameraSnapshotPlugin:
             self._cv2 = cv2
             self._np = np
             self._native_dir.mkdir(parents=True, exist_ok=True)
-            self._subscription = self._sub_node.create_subscription(
-                Image, "/ob_camera_head/color/image_raw",
-                self._on_image, _RELIABLE_QOS)
+            # Created once and kept, never recycled per start — the same rule
+            # CameraPlugin.start() documents, and for the same measured reason:
+            # destroying and recreating a subscription on a node a live executor
+            # is spinning does not reliably re-deliver. After a few stop→start
+            # cycles the subscription is still in the graph, QoS still matches,
+            # the executor is still healthy and other domain-0 sensors keep
+            # arriving — and the callback simply never fires again.
+            #
+            # That is what took the head camera down: this plugin recycled its
+            # subscription, and both camera consumers in the process went deaf
+            # to /ob_camera_head/color/image_raw while `ros2 topic hz` from a
+            # fresh process in the same container still read 6-12 Hz. The card
+            # reported `state: running`, the bridge kept its publisher, and the
+            # last frame stayed frozen on screen.
+            #
+            # `_on_image` already drops frames while stopped, so the cost of
+            # keeping it is deserialising frames nobody wants.
+            if self._subscription is None:
+                self._subscription = self._sub_node.create_subscription(
+                    Image, "/ob_camera_head/color/image_raw",
+                    self._on_image, _RELIABLE_QOS)
             self._running = True
-            print("[CameraSnapshotPlugin] subscribed to head RGB camera")
+            print("[CameraSnapshotPlugin] subscribed to head RGB camera", flush=True)
         except Exception as e:
             raise RuntimeError(f"camera snapshot initialization failed: {e}") from e
 
@@ -1326,9 +1344,9 @@ class CameraSnapshotPlugin:
         self._running = False
         with self._frame_lock:
             self._latest_frame = None
-        if self._subscription is not None:
-            self._sub_node.destroy_subscription(self._subscription)
-            self._subscription = None
+        # The subscription deliberately outlives the stop — see start(). Tearing
+        # it down here is what left the camera permanently dark after a few
+        # stop→start cycles, and a stop→start is what every start-project does.
 
     def _on_image(self, msg):
         if not self._running:
@@ -5030,13 +5048,21 @@ class TtsPlugin:
                             self._play_event_buffer.pop(seg_sid, None)
                             print(f"[TtsPlugin] cancelled (PlayEvent STOPPED) seg {i+1}/{len(segments)}")
                             break
-                        # event_code: 1=COMPLETED, 2=STOPPED (也算完成), 3=CANCELLED, 4=FAILED
-                        seg_status = "completed" if event_code <= 2 else "error"
-                        if event_code > 2:
+                        # event_code: 1=COMPLETED, 2=STOPPED, 3=CANCELLED, 4=FAILED.
+                        # STOPPED here means something *other* than our own cancel_event
+                        # stopped it — that path already broke out above as "cancelled".
+                        # This used to collapse STOPPED into "completed", which hid every
+                        # such interruption from ACP and the LLM: a segment cut short by
+                        # an external stop looked identical to one that played in full.
+                        if event_code == 1:
+                            seg_status = "completed"
+                        elif event_code == 2:
+                            seg_status = "interrupted"
+                            print(f"[TtsPlugin] seg {i+1}/{len(segments)} STOPPED externally (not our own cancel)")
+                        else:
+                            seg_status = "error"
                             event_name = self._EVENT_NAMES.get(event_code, f"UNKNOWN({event_code})")
                             print(f"[TtsPlugin] seg {i+1}/{len(segments)} failed: {event_name} (code={event_code})")
-                        elif event_code == 2:
-                            print(f"[TtsPlugin] seg {i+1}/{len(segments)} STOPPED (treated as completed)")
                     self._pending_play.pop(seg_sid, None)
                     self._pending_play_status.pop(seg_sid, None)
                 self._pending_play_duration.pop(seg_sid, None)
@@ -5048,6 +5074,11 @@ class TtsPlugin:
                     continue
                 elif seg_status == "error" and is_last:
                     overall_status = "error"
+                elif seg_status == "interrupted":
+                    # Something external stopped this segment — later segments would just
+                    # be talking over whatever stopped it, so don't keep playing.
+                    overall_status = "interrupted"
+                    break
             elif no_response:
                 # Do not sleep-then-claim-success. This path used to fall into the
                 # fallback below and report ACP completed, so a silent robot looked
@@ -6110,15 +6141,29 @@ _HAND_FINGER_LABELS = {
 
 
 def _hand_position_label(p: float) -> str:
+    """Inspire's feedback is an **open ratio**: 1.0 is open, 0.0 is closed.
+
+    This used to read the other way round, so every label was its own opposite
+    and the LLM asking "is the hand open" was told the reverse. Measured on a
+    Tianyi sitting idle with both hands visibly open: all twelve fingers report
+    0.977-1.0, which the old thresholds called `fully_closed`.
+
+    Two other places in this file already had it right and are what the
+    correction is anchored to — `HandPlugin` inverts on the way out ("Hardware
+    maps position 1.0 -> open"), and `_skeleton_hand_bend_rad` reads the same
+    feedback as an open ratio, which is why the dashboard's hands have always
+    rendered correctly. Only this function and the tool description beside it
+    disagreed.
+    """
     if p >= 0.95:
-        return "fully_closed"
+        return "fully_open"
     if p >= 0.75:
-        return "almost_closed"
+        return "almost_open"
     if p >= 0.25:
         return "half_closed"
     if p >= 0.05:
-        return "almost_open"
-    return "fully_open"
+        return "almost_closed"
+    return "fully_closed"
 
 
 class HandStatePlugin:
@@ -6154,7 +6199,7 @@ class HandStatePlugin:
             "description": (
                 "Tianyi 2.0 Pro Inspire dexterous hand state (6 fingers per hand, 10Hz)."
                 "Finger order: 1=pinky 2=ring 3=middle 4=index 5=thumb_flex 6=thumb_rotate."
-                "position: 0=open 1=closed (normalized), effort: current (A), velocity: normalized speed."
+                "position: 1=open 0=closed (normalized), effort: current (A), velocity: normalized speed."
                 "Each finger has a position_label tag (fully_open/almost_open/half_closed/almost_closed/fully_closed)."
             ),
             "inputSchema": {"type": "object", "properties": {}},

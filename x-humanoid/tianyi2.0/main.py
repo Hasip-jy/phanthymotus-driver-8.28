@@ -38,6 +38,15 @@ import subprocess
 import sys
 import threading
 import time
+
+try:
+    from common import lifecycle as _lifecycle
+except ImportError:  # a checkout rather than the container image, where
+    # common/ is copied in beside this file. Load-bearing, so it resolves the
+    # repo root rather than degrading to a no-op the way logsafe does.
+    import sys as _sys, pathlib as _pathlib
+    _sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parents[2]))
+    from common import lifecycle as _lifecycle
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -514,6 +523,14 @@ class TianyiDeviceBundle:
             self._plugins.append(HandPlugin(plugins_cfg["hand"], namespace, ros2))
             print("[bundle] HandPlugin loaded")
 
+        if plugins_cfg.get("servo", {}).get("enabled", False):
+            from servo import TianyiServoPlugin
+            # Stream-shaped control of both arms and both hands (motus.control/1).
+            # Present but inert: it subscribes to nothing until someone wires it
+            # on the canvas and confirms.
+            self._plugins.append(TianyiServoPlugin(plugins_cfg["servo"], namespace, ros2))
+            print("[bundle] TianyiServoPlugin loaded")
+
         if plugins_cfg.get("tts", {}).get("enabled", False):
             from device import TtsPlugin
             self._plugins.append(TtsPlugin(plugins_cfg["tts"], namespace, ros2))
@@ -637,7 +654,7 @@ class TianyiDeviceBundle:
                             self._started_plugins.add(p)
                             print(f"[bundle] {type(p).__name__} lazy-started via MCP")
                         except Exception as e:
-                            return {"error": f"start failed: {e}"}
+                            return {"state": "error", "error": f"start failed: {e}"}
                     args['_tool_name'] = tool_name
                     result = p.dispatch(action, args)
                     # 工具存在但插件不认这个 action：别把 None 冒泡上去，
@@ -645,6 +662,10 @@ class TianyiDeviceBundle:
                     if result is None:
                         return {"state": "error",
                                 "error": f"Unknown action: {action} (tool={tool_name})"}
+                    # A plugin that only knows its own verbs declines these
+                    # rather than failing at them — see common/lifecycle.py.
+                    if action in _lifecycle.LIFECYCLE_ACTIONS and _lifecycle.is_declined(result):
+                        return _lifecycle.reply(action, p in self._started_plugins)
                     return result
         return None
 
@@ -718,7 +739,15 @@ def make_handler():
             self.wfile.write(encoded)
 
         def do_GET(self):
-            if self.path.split("?")[0] == "/sse":
+            # `/mcp/sse` is what the client actually asks for. agent-core builds
+            # the URL as `<mcp url>/sse`, and the configured url already ends in
+            # `/mcp` — so this driver's `/sse` has never once been reached, and
+            # every probe since the SSE subscription shipped has 404'd. Four of
+            # the fifteen drivers here serve `/mcp/sse`; that is the convention.
+            #
+            # `/sse` stays accepted: dropping it would be betting that nothing
+            # else ever learned to call it, and the bet buys nothing.
+            if self.path.split("?")[0] in ("/mcp/sse", "/sse"):
                 # SSE streaming endpoint for ACP completion events
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")

@@ -43,6 +43,14 @@ from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 from unitree_sdk2py.h2.loco.h2_loco_client import LocoClient
 from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient
 from rpc_proxy import RpcProxy
+try:
+    from common import lifecycle as _lifecycle
+except ImportError:  # a checkout rather than the container image, where
+    # common/ is copied in beside this file. Load-bearing, so it resolves the
+    # repo root rather than degrading to a no-op the way logsafe does.
+    import sys as _sys, pathlib as _pathlib
+    _sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parents[2]))
+    from common import lifecycle as _lifecycle
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -92,8 +100,22 @@ class R1DeviceBundle:
         if plugins_cfg.get("loco", {}).get("enabled", False):
             from device import LocoStatePlugin, LocoPlugin
             self._plugins.append(LocoStatePlugin(plugins_cfg["loco"], namespace, executor))
-            self._plugins.append(LocoPlugin(plugins_cfg["loco"], namespace, executor, loco_client))
+            loco = LocoPlugin(plugins_cfg["loco"], namespace, executor, loco_client)
+            self._plugins.append(loco)
             print("[bundle] LocoStatePlugin + LocoPlugin loaded")
+
+            # The streaming counterpart to `loco`. Constructed here, right after
+            # it, because it needs a reference to `loco` to arbitrate over the
+            # chassis — and it must exist before SmartMotionPlugin below, which
+            # looks it up by PREFIX and would otherwise interrupt only half the
+            # ways this robot can be moving.
+            if plugins_cfg.get("loco_servo", {}).get("enabled", False):
+                from loco_servo import LocoServoPlugin
+                self._plugins.append(LocoServoPlugin(
+                    plugins_cfg["loco_servo"], namespace, executor, loco_client,
+                    loco_plugin=loco,
+                ))
+                print("[bundle] LocoServoPlugin loaded")
 
         if plugins_cfg.get("state", {}).get("enabled", False):
             from device import StatePlugin
@@ -125,12 +147,16 @@ class R1DeviceBundle:
             from device import SmartMotionPlugin
             speaker_plugin = next((p for p in self._plugins if getattr(p, 'PREFIX', '') == 'speaker'), None)
             loco_plugin = next((p for p in self._plugins if getattr(p, 'PREFIX', '') == 'loco'), None)
+            servo_plugin = next((p for p in self._plugins if getattr(p, 'PREFIX', '') == 'locoservo'), None)
             self._plugins.append(SmartMotionPlugin(
                 plugins_cfg.get("smart_motion", {}), namespace, executor,
                 speaker_plugin=speaker_plugin,
                 loco_plugin=loco_plugin,
+                loco_servo_plugin=servo_plugin,
             ))
-            print(f"[bundle] SmartMotionPlugin loaded (speaker={'yes' if speaker_plugin else 'no'}, loco={'yes' if loco_plugin else 'no'})")
+            print(f"[bundle] SmartMotionPlugin loaded (speaker={'yes' if speaker_plugin else 'no'}, "
+                  f"loco={'yes' if loco_plugin else 'no'}, "
+                  f"loco_servo={'yes' if servo_plugin else 'no'})")
 
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):
@@ -166,6 +192,10 @@ class R1DeviceBundle:
                     action = args.pop("action", tool_name)
                     args['_tool_name'] = tool_name
                     result = p.dispatch(action, args)
+                    # A plugin that only knows its own verbs declines these
+                    # rather than failing at them — see common/lifecycle.py.
+                    if action in _lifecycle.LIFECYCLE_ACTIONS and _lifecycle.is_declined(result):
+                        return _lifecycle.reply(action)
                     return result
         return None
 
@@ -309,32 +339,23 @@ def main():
 
     print(f"[bundle] namespace={namespace} mcp_port={mcp_port}")
 
-    # DDS init — try specified interface, fallback to interface holding 192.168.123.164
-    dds_ok = False
-    ifaces_to_try = [network_iface]
-    # Detect interface for 192.168.123.x subnet as fallback
-    try:
-        import netifaces
-        for iface_name in netifaces.interfaces():
-            addrs = netifaces.ifaddresses(iface_name).get(netifaces.AF_INET, [])
-            for addr in addrs:
-                if addr["addr"].startswith("192.168.123."):
-                    if iface_name not in ifaces_to_try:
-                        ifaces_to_try.append(iface_name)
-    except ImportError:
-        pass
-    ifaces_to_try.append("")  # auto-detect as last resort
+    # DDS init — retried in the background, not attempted once and abandoned.
+    #
+    # On r1_sz this bundle started three seconds before eth10 existed, the one
+    # attempt failed, and every state topic on that robot stayed empty from boot
+    # while the cards publishing them looked healthy on the canvas. The
+    # interface list is recomputed on every attempt, because the thing being
+    # waited for is an interface that does not exist yet. See common/dds_link.py.
+    from common import dds_link as _dds_link
 
-    for iface in ifaces_to_try:
-        try:
-            ChannelFactoryInitialize(0, iface)
-            print(f"[bundle] DDS initialized on interface: {iface or '(auto)'}")
-            dds_ok = True
-            break
-        except Exception as e:
-            print(f"[bundle] DDS init failed on '{iface}': {e}")
-    if not dds_ok:
-        print("[bundle] WARNING: DDS unavailable — robot communication disabled, MCP server still starting")
+    _link = _dds_link.install(network_iface)
+    # A short wait so the common case — the interface is already there — still
+    # looks synchronous in the log and cards subscribe before the first tool
+    # call. Failing this wait is not fatal: the link keeps trying, and anything
+    # registered through `on_ready` subscribes the moment it succeeds.
+    if not _link.wait(5.0):
+        print("[bundle] DDS 还没连上，后台继续重试 —— MCP 照常启动，"
+              "机器人状态话题在连上之前是空的", flush=True)
 
     # NOTE: this used to redirect fd 1 to /dev/null and move the real log pipe
     # to a dup'd high fd, to "suppress C++ layer stdout". That was wrong on both
@@ -348,8 +369,10 @@ def main():
     # RPC Proxy — runs LocoClient + AudioClient in a subprocess to avoid GIL contention.
     # The main process has many threads (ROS2 executor, camera, mic) which starve
     # CycloneDDS listener callbacks, causing RPC response timeouts (3104).
-    # Use the same interface that succeeded for main process DDS.
-    rpc_iface = iface if dds_ok else network_iface
+    # Use the same interface that succeeded for main process DDS — the link
+    # reports which one that was, which is not necessarily the configured name
+    # (the fallback scan may have found another, or auto-detect may have won).
+    rpc_iface = _link.interface if _link.ready else network_iface
     rpc_proxy = RpcProxy(network_iface=rpc_iface)
     print("[bundle] RpcProxy subprocess started")
 

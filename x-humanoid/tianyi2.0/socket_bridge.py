@@ -33,9 +33,14 @@ import rclpy
 from rclpy.context import Context
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from rclpy.serialization import deserialize_message
+from rclpy.serialization import deserialize_message, serialize_message
 from rosidl_runtime_py.utilities import get_message
 
+
+# How often a bridged topic reports how many messages it has carried. Time-based
+# rather than count-based so a 16 kHz audio topic costs the same number of log
+# lines as a 10 Hz one; see the comment in TopicHandler.publish.
+PROGRESS_INTERVAL_S = 300.0
 
 # Default QoS profiles
 RELIABLE_QOS = QoSProfile(
@@ -62,6 +67,9 @@ class TopicHandler:
         self.msg_class = get_message(msg_type_name)
         self.msg_count = 0
         self.context_invalid = False
+        # Starts at 0 so the very first message always prints; after that the
+        # interval governs.
+        self._last_progress_ts = 0.0
 
         # Create publisher on domain 42
         self.node = Node(
@@ -89,7 +97,23 @@ class TopicHandler:
             if ("camera" in self.topic or "imu" in self.topic) and self.msg_count <= 5:
                 print(f"[socket-bridge] {self.topic}: msg #{self.msg_count}, serialized={len(serialized_msg)} bytes, type={type(msg)}", flush=True)
 
-            if self.msg_count % 100 == 0:
+            # Progress on a clock, not on a message count.
+            #
+            # Every 100 messages sounds modest until you notice the rate: a
+            # 16 kHz audio topic and the joint stream each produced ~750 lines,
+            # and all the bridged topics together were 78% of this container's
+            # log (2200 of 2809). That crowds out the plugin errors, which are
+            # the only reason anyone opens it.
+            #
+            # What the line is for is "is data still flowing", and a 5-minute
+            # tick answers that just as well as a rate-proportional one — while
+            # costing the same few lines whether the topic carries 10 Hz of
+            # joint state or 16 kHz of audio. The first message is still logged
+            # immediately, because "did this bridge ever work" is a different
+            # question and it wants an instant answer.
+            now = time.monotonic()
+            if self.msg_count == 1 or now - self._last_progress_ts >= PROGRESS_INTERVAL_S:
+                self._last_progress_ts = now
                 print(
                     f"[socket-bridge] {self.topic}: published {self.msg_count} messages",
                     flush=True,
@@ -110,15 +134,150 @@ class TopicHandler:
             traceback.print_exc()
 
 
+def qos_from(spec: dict) -> QoSProfile:
+    """Rebuild the caller's QoS on this side of the socket.
+
+    Outbound deliberately forces BEST_EFFORT (see TopicHandler) because every
+    reader in agent-core is BEST_EFFORT. Inbound has no such luxury: the profile
+    has to match whatever is *publishing* on domain 42, and a mismatch there is
+    silent — the subscription exists, the publisher exists, and no data moves.
+    """
+    spec = spec or {}
+    reliability = (ReliabilityPolicy.RELIABLE
+                   if str(spec.get("reliability", "best_effort")).lower() == "reliable"
+                   else ReliabilityPolicy.BEST_EFFORT)
+    return QoSProfile(
+        reliability=reliability,
+        history=HistoryPolicy.KEEP_LAST,
+        depth=int(spec.get("depth", 1)),
+        durability=DurabilityPolicy.VOLATILE,
+    )
+
+
+class SubscriptionHandler:
+    """One inbound topic: subscribes on domain 42, writes frames back to the client.
+
+    The mirror image of TopicHandler, and it exists because the bridge used to
+    have no inbound direction at all. The main process cannot subscribe on domain
+    42 itself — its participant runs under the vendor DDS profile so that the
+    body link on 192.168.41.x stays up, and that participant is invisible to
+    agent-core. Publishers had a way across; subscriptions did not, so a card
+    that needed to *receive* started cleanly, reported running, and never heard
+    anything. `servo` was the first such card.
+
+    One handler per connection rather than per topic: each carries the socket it
+    forwards to, and two cards subscribing to one topic are two readers.
+    """
+
+    def __init__(self, topic: str, msg_type_name: str, qos: QoSProfile,
+                 ctx: Context, executor, conn: socket.socket):
+        self.topic = topic
+        self.msg_class = get_message(msg_type_name)
+        self.conn = conn
+        self.msg_count = 0
+        self.failed = False
+        self._send_lock = threading.Lock()
+        # Starts at 0 so the first forwarded message always prints; after that
+        # PROGRESS_INTERVAL_S governs. Same contract as TopicHandler.
+        self._last_progress_ts = 0.0
+
+        name = f"bridge_in_{topic.strip('/').replace('/', '_')}_{id(conn) & 0xffff:x}"
+        self.node = Node(name, context=ctx)
+        self.sub = self.node.create_subscription(
+            self.msg_class, topic, self._forward, qos)
+        executor.add_node(self.node)
+        print(f"[socket-bridge] inbound handler created: {topic} ({msg_type_name})",
+              flush=True)
+
+    def _forward(self, msg):
+        """Same framing as the outbound direction, in the other direction."""
+        if self.failed:
+            return
+        try:
+            data = serialize_message(msg)
+            with self._send_lock:
+                self.conn.sendall(struct.pack("<I", len(data)))
+                self.conn.sendall(data)
+            self.msg_count += 1
+            # On a clock, not a message count — the same reasoning as the
+            # outbound direction, which was changed first and left this one
+            # behind. A count-based trigger is loudest on the fastest topics,
+            # which are exactly the ones needing the least commentary, and
+            # nearly silent on slow ones where a stall would matter most.
+            #
+            # Inbound topics happen to be low-rate today, so this is not what is
+            # flooding the log. It is the same latent bug all the same: the day
+            # something high-rate is wired inbound, it floods.
+            now = time.monotonic()
+            if self.msg_count == 1 or now - self._last_progress_ts >= PROGRESS_INTERVAL_S:
+                self._last_progress_ts = now
+                print(f"[socket-bridge] {self.topic}: forwarded {self.msg_count} "
+                      f"messages inbound", flush=True)
+        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+            # Marked rather than raised: this runs on the executor thread, and a
+            # raise here would take down every other topic sharing it.
+            self.failed = True
+            print(f"[socket-bridge] inbound {self.topic}: client gone ({e})",
+                  flush=True)
+        except Exception as e:      # noqa: BLE001
+            # Anything else is our bug, not the client's departure, and saying
+            # "client gone" about a NameError sends the next person to look at
+            # the socket. Caught for the same reason as above, reported honestly.
+            self.failed = True
+            print(f"[socket-bridge] inbound {self.topic}: forwarding failed "
+                  f"({type(e).__name__}: {e})", flush=True)
+            import traceback
+            traceback.print_exc()
+
+    def close(self, executor):
+        try:
+            executor.remove_node(self.node)
+        finally:
+            # destroy_node, not only remove_node: otherwise the subscription and
+            # the ROS node name leak, and the next start collides with itself.
+            self.node.destroy_node()
+
+
 class SocketBridgeServer:
     """Manages Unix socket server and topic handlers."""
 
     SOCKET_DIR = "/tmp/tianyi_bridge"
 
+    # Loopback-only profile every other container on domain 42 loads. Set here
+    # rather than inherited from the environment, for two reasons:
+    #
+    #  * Inheriting is what broke. This process only ever *read* the variable
+    #    and printed it; the container never set it, because setting it in
+    #    compose would apply to main.py too and confine the body context to
+    #    127.0.0.1, cutting the vendor link on 192.168.41.x. So the bridge fell
+    #    back to FastDDS's default transport, bound every interface, and stopped
+    #    matching the loopback-only readers in agent-core and perception.
+    #  * Setting it per process is the documented way out of "one profile per
+    #    process": this is a separate process from main.py, so its profile is
+    #    its own. joints_bridge_v2.run_publisher already does exactly this.
+    #
+    # The symptom was size-dependent and therefore misleading: small topics
+    # (joints, ext_mic) still got through often enough to look healthy, while
+    # 47 KB camera frames were dropped almost entirely — so the camera looked
+    # broken and everything else looked fine.
+    DDS_LOCAL_PROFILE = "/opt/phanthy-motus/dds-local.xml"
+
     def __init__(self):
-        # Setup domain 42 with default DDS config (same as agent-core)
-        # Agent-core and socket bridge must use the same DDS configuration
-        # to communicate. They inherit from main process environment.
+        # Must precede rclpy.init: FastDDS reads the variable when the
+        # participant is created and caches the parsed profile process-wide.
+        if os.path.exists(self.DDS_LOCAL_PROFILE):
+            os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] = self.DDS_LOCAL_PROFILE
+            print(f"[socket-bridge] using DDS profile {self.DDS_LOCAL_PROFILE}", flush=True)
+        else:
+            # Loud, because the failure it precedes is not: the bridge would
+            # publish happily onto a transport nothing else is listening on.
+            print(
+                f"[socket-bridge] WARNING: {self.DDS_LOCAL_PROFILE} not found — "
+                "falling back to FastDDS defaults, which bind every interface "
+                "and will NOT match agent-core's loopback-only readers",
+                flush=True,
+            )
+
         self.ctx = Context()
         rclpy.init(context=self.ctx, domain_id=42)
         self.executor = rclpy.executors.MultiThreadedExecutor(context=self.ctx)
@@ -157,8 +316,16 @@ class SocketBridgeServer:
 
             topic = metadata["topic"]
             msg_type = metadata["msg_type"]
+            # Absent means "out": every client written before the inbound
+            # direction existed sends no direction field, and must keep working.
+            direction = metadata.get("direction", "out")
 
-            print(f"[socket-bridge] new client: {topic} ({msg_type})", flush=True)
+            print(f"[socket-bridge] new client: {topic} ({msg_type}) [{direction}]",
+                  flush=True)
+
+            if direction == "in":
+                self.handle_inbound(conn, topic, msg_type, metadata.get("qos"))
+                return
 
             # Create handler if not exists or if previous handler has invalid context
             if topic not in self.handlers or getattr(self.handlers.get(topic), 'context_invalid', False):
@@ -203,6 +370,36 @@ class SocketBridgeServer:
             print(f"[socket-bridge] client handler error: {e}", flush=True)
         finally:
             conn.close()
+
+    def handle_inbound(self, conn: socket.socket, topic: str, msg_type: str,
+                       qos_spec):
+        """Subscribe on domain 42 for this client until it disconnects.
+
+        Nothing is read from the socket afterwards — the client never sends
+        again — so `recv` here is purely how a disconnect is noticed. It returns
+        b"" on a clean close and raises on a reset; either ends the handler and
+        tears the subscription down, which is what keeps a start/stop cycle from
+        leaving a live reader behind.
+        """
+        handler = None
+        try:
+            handler = SubscriptionHandler(topic, msg_type, qos_from(qos_spec),
+                                          self.ctx, self.executor, conn)
+            while not self._stop_flag.is_set():
+                conn.settimeout(1.0)
+                try:
+                    if not conn.recv(1):
+                        break                      # client closed
+                except socket.timeout:
+                    if handler.failed:
+                        break                      # forwarding side gave up
+                    continue
+        except Exception as e:      # noqa: BLE001
+            print(f"[socket-bridge] inbound {topic} error: {e}", flush=True)
+        finally:
+            if handler is not None:
+                handler.close(self.executor)
+            print(f"[socket-bridge] inbound handler closed: {topic}", flush=True)
 
     def start(self):
         """Start bridge server with single dynamic socket."""

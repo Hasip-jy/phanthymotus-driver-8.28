@@ -27,6 +27,87 @@ Available tools are:
 - `model`: simplified RM75-6F-V URDF for live skeleton display. Its seven
   movable joint names exactly match the `joint_states` skeleton stream.
 - `joint_control`: bounded joint-space motion and controlled stop.
+- `abs_move`: `move` reads the current TCP as A and moves to
+  the requested base-frame B using
+  joint-space planning by default, with an explicit TCP-linear mode available.
+  Relative `move_offset`, absolute `movel`, and waypoint `movep` are not exposed.
+- `ext_camera`: multi-instance upper-computer USB camera card. A RealSense
+  instance can publish RGB, depth, or left infrared without going through the
+  RealMan controller.
+
+## Upper-computer RealSense camera
+
+The camera is connected to the Linux upper computer that runs this Driver,
+not to the RM75 controller. Camera capture and arm control therefore have
+independent data paths:
+
+```text
+ext_camera -> pyrealsense2 -> upper-computer RealSense USB camera
+joint_control -> RealMan API2 -> RM75 controller TCP port 8080
+```
+
+`ext_camera` is a multi-instance sensor. Configure each card with an
+`instance_id`, a RealSense selected by serial number, and one `channel`:
+
+| channel | topic | format |
+| --- | --- | --- |
+| `rgb` | `/{namespace}/ext_camera/{instance_id}/rgb` | `image/jpeg` |
+| `depth` | `/{namespace}/ext_camera/{instance_id}/depth` | `image/depth-zlib` |
+| `infrared` | `/{namespace}/ext_camera/{instance_id}/infrared` | `image/jpeg` |
+
+Hyphens in `instance_id` become underscores in the ROS topic. Discovery and
+capture use `pyrealsense2`; the selected camera is bound by its stable serial
+number rather than a dynamic `/dev/videoN` path in Canvas. The target Linux
+ARM64 wheel uses its V4L2 backend internally, so deployment must expose the
+current video nodes as described below. Existing single-camera
+Canvas projects that saved an old `/dev/videoN` selection are migrated
+automatically when they next start.
+
+Depth is 640x480 little-endian uint16 millimetres compressed with zlib. Zero
+is invalid/unrepresentable depth. Infrared is the left Y8 stream rendered as a
+grayscale JPEG; it is reflected near-infrared intensity, not temperature.
+RGB, depth and infrared instances on one camera share one SDK pipeline. The
+pipeline captures each physical stream once and fans it out to every card that
+selected that channel, so three cards do not compete for the D435.
+
+The image pins `pyrealsense2==2.56.5.9235`, matching the repository's verified
+Linux ARM64 / Python 3.10 runtime. The image does not install the `v4l-utils`
+command-line package. Do not run `realsense-viewer` or another capture process
+against the same D435 while the card is active.
+
+Deployment binds `/dev:/dev:ro` and grants character-device read/write access
+for V4L2 major 81 and USB major 189, including newly allocated minor numbers.
+No `/dev/videoN` or USB bus address is configured. Docker can start without a
+camera; later connections and node renumbering are visible through the directory
+bind. The service does not use privileged mode and drops MKNOD. The read-only
+mount protects directory entries; device I/O is still read/write under cgroup
+rules. A separate writable, container-private 128 MiB tmpfs is mounted at
+`/dev/shm` for Python multiprocessing semaphores and DDS shared memory. Without
+this override, a read-only `/dev` can cause camera start to fail with
+`[Errno 30] Read-only file system` before the capture process starts.
+This deliberately exposes host device names and permits access to all
+video/USB devices, not just one camera; the SDK selection remains serial-bound.
+
+Both Web Console and `deploy/run-pr-image.sh` use this same service fragment.
+Redeploy the new image once to replace older exact-node mappings; no per-node
+environment variables or host scanning script are needed afterwards.
+
+Each tools-list request refreshes camera discovery, so a camera connected after
+Driver startup can appear in its configuration schema. Existing active cards
+keep their serial number: after a disconnect or frame timeout the worker closes
+its pipeline, waits two seconds, then recreates the SDK context and retries the
+same camera. It never substitutes another connected serial. Errors remain
+visible and `fresh` stays false until new frames arrive. Stopping the last card
+cancels retries. Frame counters restart when a new capture session is opened.
+A UI which caches tool schemas may need its device/tool list refreshed.
+
+The observed target hardware is an Intel RealSense D435 (USB ID `8086:0b07`).
+On USB 3, the shared pipeline uses RGB 1280x720 and depth/infrared 640x480 at
+15 fps. A USB 2 connection falls back to 640x480 at 6 fps for all streams.
+
+For a supervised hardware check, create separate RGB, depth and infrared card
+instances, start them, then confirm that `frames_published` increases and the
+three topics render independently. USB disconnect becomes an explicit error until the same camera reconnects.
 
 The deployment enables its motion capability, and every `set` call must still
 include `confirm_motion=true`. `joint1_deg` through `joint7_deg` are absolute
@@ -48,6 +129,28 @@ at 300 seconds, as a final safeguard.
 The first supervised hardware test should change exactly one joint by no more
 than 1 degree at 1 percent speed. A reachable physical E-stop and a clear work
 area are required. Software interlocks do not replace the robot safety system.
+
+Physical motion and `abs_move` are enabled in the default deployment;
+`abs_move` can be disabled with `RM75_CARTESIAN_ENABLED=0`. Verify the active
+TCP, arrival device, and workspace envelope before use. Every
+`abs_move.move` request must also set both
+`cartesian_enabled=true` and `confirm_motion=true`. `move` reads the
+measured TCP as A and accepts B pose fields (`x/y/z` in millimetres and `rx/ry/rz` in
+degrees). Any omitted B axis keeps the measured A value, so callers
+can provide only `x/y/z` to preserve the current orientation. At least one B
+field is required. It validates the composed B pose against the configured
+workspace envelope. `motion_mode=joint` (the default) submits `rm_movej_p` and
+is intended for general repositioning or large orientation changes;
+`motion_mode=linear` submits `rm_movel` and is intended for a verified straight
+approach or retreat. Planning failure, an unreachable pose, collision stop,
+timeout, or an operator stop ends the action and releases the motion lock.
+After a controller-event timeout or cancellation, `info` may report
+`controller_trajectory_state: draining`. The action is already terminal, but a
+new controller trajectory is rejected until the previous untagged SDK event is
+consumed; this prevents a late event from completing the next action.
+The controller's collision level, electronic fences, virtual walls, and
+physical safety system remain responsible for collision protection; the driver
+has no environment model and does not plan a detour around obstacles.
 
 The HTTP service listens on port `15718` and provides `/health` and `/mcp`.
 The normal Agent Core runtime still initializes its ROS/DDS transport, but robot
@@ -72,9 +175,26 @@ library is absent. Set `RM_API2_LIB_DIR` to override the host directory.
 Following the standard ACP contract in `README_dev.md`, `joint_control.set` immediately returns a
 unique `action_id`; its background monitor later reports exactly one
 `completed`, `error`, or `cancelled` terminal result to `/api/acp/complete`.
-The callback reads `AGENT_CORE_URL` inside the worker-thread function and uses
-the same HTTPS behavior as the documented G1/R1 implementation. Agent Core
+The callback reads `AGENT_CORE_URL` inside the worker-thread function and
+verifies TLS against the Agent Core CA (see the deployment prerequisite
+below); it never falls back to unverified HTTPS. Agent Core
 owns pending-action barrier release and completion-event delivery.
+
+### Agent Core CA prerequisite
+
+Completion callbacks POST over TLS with certificate verification enabled, so
+every RM75 deployment must provide the Agent Core CA on the host at
+
+```text
+/opt/phanthy-motus/data/certs/cert.pem
+```
+
+`service.yml` mounts that directory read-only and points `AGENT_CORE_CA_CERT`
+at the file; override either with `RM75_CA_DIR` / `RM75_AGENT_CORE_CA_CERT`
+when the host layout differs. When the CA file is missing, each asynchronous
+joint/gripper/Cartesian completion callback fails with
+`AGENT_CORE_CA_CERT is required` while motion itself continues — verify the
+path before enabling the deployment.
 
 The immediate card result contains only `state` and `action_id`. Completion
 callbacks keep the standard status and a short reason; full final joint evidence
@@ -85,12 +205,24 @@ trigger. No extra `/api/event` notifications are sent. This Driver cannot repair
 a stalled Core decision loop; a missing UI trigger alone is not proof of motion
 or callback failure.
 
-The component installs `python3-yaml` because the shared runtime loads
-`config.yaml`, and `ros-humble-rmw-fastrtps-cpp` because the shared runtime
-creates the Agent Core ROS 2 participant. No compiler, pip, or ROS build tooling
-is installed. See `vendor/SOURCE.md` for provenance notes.
+The component installs `python3-pip` to install the pinned camera wheels,
+`python3-yaml` because the shared runtime loads `config.yaml`, and
+`ros-humble-rmw-fastrtps-cpp` because the shared runtime creates the Agent Core
+ROS 2 participant. The camera layer installs the ARM64 `pyrealsense2` wheel,
+NumPy 1.23.5 and headless OpenCV 4.11.0.86 through pip. The wheel supplies its
+own RealSense implementation but dynamically loads `libusb-1.0.so.0`. The build
+downloads Ubuntu's signed `libusb-1.0-0` runtime package and extracts only that
+shared object into `/opt/realman/libusb`; it does not execute or suppress package
+maintainer scripts and does not claim the package is installed in dpkg.
+The SDK uses V4L2 directly without `v4l-utils`; no compiler, desktop OpenCV backend or
+ROS build tooling is installed. Every download/extraction step must succeed and
+the apt layer must finish with an empty `dpkg --audit`; package-install failures
+and partially configured package states are never accepted.
+See `vendor/SOURCE.md` for provenance notes.
 
-The TCP-only RM75 service does not require privileged mode or a host `/dev` mount.
+The RM75 API2 TCP path itself does not require privileged mode or host devices.
+The bundled upper-computer camera receives only the USB bus access required by
+RealSense enumeration and capture, as described above.
 Skeleton publication skips disconnected/busy SDK clients, retries failed samples
 at most every two seconds, and logs once per outage until a successful sample.
 An already-running SDK TCP query still holds the SDK lock until it returns.
